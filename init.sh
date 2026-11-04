@@ -23,7 +23,7 @@ msg()  { printf "${B}[cyremia %s]${N} %s\n" "$(date +%H:%M:%S)" "$*" | tee -a "$
 ok()   { printf "${V}   ✔ %s${N}\n" "$*" | tee -a "$LOG"; }
 warn() { printf "${J}   ⚠ %s${N}\n" "$*" | tee -a "$LOG"; ERREURS=$((ERREURS+1)); }
 ERREURS=0
-ETAPES=10; ETAPE=0
+ETAPES=11; ETAPE=0
 # Barre d'avancement globale : [■■■■■□□□□□]  50 %  étape 5/10
 barre() { local p=$1 plein=$(( $1 / 5 )) b=""; for i in $(seq 1 20); do [ "$i" -le "$plein" ] && b="$b■" || b="$b·"; done
   printf "\n${V}[%s] %3d %%${N}" "$b" "$p"; }
@@ -75,8 +75,16 @@ ok "hostname = $NOM"
 # ── 2. Paquets de base ───────────────────────────────────────────────────
 etape "Mise à jour de la liste des paquets et installation des outils"
 export DEBIAN_FRONTEND=noninteractive
-travail "Liste des paquets" apt-get update -q || warn "apt-get update a signalé une erreur"
-travail "Installation des outils" apt-get install -y -q curl ca-certificates ufw smartmontools htop jq unattended-upgrades openssh-server \
+APT="apt-get -q -o DPkg::Lock::Timeout=600"
+# Réessaie une commande jusqu'à 3 fois en réparant ce qui peut l'être entre deux essais
+essayer() { local lib="$1"; shift; local n
+  for n in 1 2 3; do
+    travail "$lib" "$@" && return 0
+    printf "${J}   ↻ %s : échec (essai %d/3), réparation puis nouvel essai${N}\n" "$lib" "$n" | tee -a "$LOG"
+    dpkg --configure -a >>"$LOG" 2>&1; $APT -f install -y >>"$LOG" 2>&1; sleep $((n*5))
+  done; return 1; }
+essayer "Liste des paquets" $APT update || warn "apt-get update a signalé une erreur"
+essayer "Installation des outils" $APT install -y curl ca-certificates ufw smartmontools htop jq unattended-upgrades openssh-server \
   && ok "curl, ufw, smartmontools, htop, jq, openssh-server" || warn "installation des paquets incomplète"
 
 # ── 3. Accès SSH par clé ─────────────────────────────────────────────────
@@ -122,7 +130,7 @@ ok "/etc/apt/apt.conf.d/99cyremia-serveur"
 # ── 5. Tailscale ─────────────────────────────────────────────────────────
 etape "Tailscale"
 if ! command -v tailscale >/dev/null 2>&1; then
-  travail "Installation de Tailscale" sh -c "curl -fsSL https://tailscale.com/install.sh | sh" && ok "Tailscale installé" || warn "installation de Tailscale échouée"
+  essayer "Installation de Tailscale" sh -c "curl -fsSL https://tailscale.com/install.sh | sh" && ok "Tailscale installé" || warn "installation de Tailscale échouée"
 fi
 if command -v tailscale >/dev/null 2>&1; then
   if tailscale status >/dev/null 2>&1; then
@@ -146,7 +154,7 @@ if [ -n "$ARCH" ]; then
   if [ ! -x /opt/beszel-agent/beszel-agent ]; then
     id beszel >/dev/null 2>&1 || useradd -r -M -s /usr/sbin/nologin beszel
     install -d -o beszel -g beszel /opt/beszel-agent
-    travail "Téléchargement de Beszel" sh -c "curl -fsSL https://github.com/henrygd/beszel/releases/latest/download/beszel-agent_linux_${ARCH}.tar.gz | tar -xz -C /opt/beszel-agent beszel-agent" && chown beszel:beszel /opt/beszel-agent/beszel-agent \
+    essayer "Téléchargement de Beszel" sh -c "curl -fsSL https://github.com/henrygd/beszel/releases/latest/download/beszel-agent_linux_${ARCH}.tar.gz | tar -xz -C /opt/beszel-agent beszel-agent" && chown beszel:beszel /opt/beszel-agent/beszel-agent \
       && ok "binaire Beszel installé" || warn "téléchargement de Beszel échoué"
   fi
   usermod -aG disk beszel 2>/dev/null || true
@@ -186,8 +194,8 @@ etape "Agent Alloy (journaux système vers Loki)"
 if [ -n "$ARCH" ]; then
   if ! command -v alloy >/dev/null 2>&1 || ! alloy --version 2>/dev/null | grep -q "$ALLOY_VERSION"; then
     DEB="/tmp/alloy-${ALLOY_VERSION}.deb"
-    travail "Téléchargement d'Alloy" curl -fsSL -o "$DEB" "https://github.com/grafana/alloy/releases/download/v${ALLOY_VERSION}/alloy-${ALLOY_VERSION}-1.${ARCH}.deb" \
-      && travail "Installation d'Alloy" apt-get install -y -q "$DEB" && ok "Alloy $ALLOY_VERSION installé" || warn "installation d'Alloy échouée"
+    essayer "Téléchargement d'Alloy" curl -fsSL -o "$DEB" "https://github.com/grafana/alloy/releases/download/v${ALLOY_VERSION}/alloy-${ALLOY_VERSION}-1.${ARCH}.deb" \
+      && essayer "Installation d'Alloy" $APT install -y "$DEB" && ok "Alloy $ALLOY_VERSION installé" || warn "installation d'Alloy échouée"
     rm -f "$DEB"
   fi
   if [ -d /etc/alloy ]; then
@@ -326,6 +334,31 @@ for d in $(lsblk -dno NAME,TYPE | awk '$2=="disk"{print $1}'); do
   s="$(smartctl -H /dev/$d 2>/dev/null | grep -Eo 'PASSED|FAILED|OK' | head -1)"
   [ -n "$s" ] && echo "   /dev/$d : $s" | tee -a "$LOG"
 done
+
+# ── 11. Contrôle final : chaque brique est testée, réparée si possible ─
+etape "Contrôle final"
+controle() { local lib="$1" test="$2" repare="${3:-}"
+  if eval "$test" >/dev/null 2>&1; then ok "$lib"; return; fi
+  if [ -n "$repare" ]; then
+    printf "${J}   ↻ %s : KO, tentative de réparation${N}\n" "$lib" | tee -a "$LOG"
+    eval "$repare" >>"$LOG" 2>&1; sleep 4
+    if eval "$test" >/dev/null 2>&1; then ok "$lib (réparé)"; return; fi
+  fi
+  warn "$lib : TOUJOURS EN ÉCHEC"; }
+controle "nom de la machine = $NOM"     '[ "$(hostname)" = "$NOM" ]'                       'hostnamectl set-hostname "$NOM"'
+controle "clés SSH en place"            'grep -q "^ssh-" "$AK"'
+controle "serveur SSH actif"            'systemctl is-active ssh'                            'systemctl restart ssh'
+controle "SSH par clé uniquement"       'sshd -T 2>/dev/null | grep -qx "passwordauthentication no"' 'systemctl reload ssh'
+controle "sudo sans mot de passe"       'sudo -u "$UTILISATEUR" sudo -n true'
+controle "Tailscale connecté"           'tailscale status'                                   'systemctl restart tailscaled; sleep 3; tailscale up --hostname="$NOM" --timeout=20s'
+controle "Loki joignable via Tailscale" 'curl -fsS --max-time 5 http://100.124.28.18:3100/ready'
+controle "agent Beszel actif"           'systemctl is-active beszel-agent'                   'systemctl restart beszel-agent'
+controle "Beszel écoute sur 45876"      'ss -ltn | grep -q ":45876 "'                        'systemctl restart beszel-agent'
+controle "agent Alloy actif"            'systemctl is-active alloy'                          'systemctl restart alloy'
+controle "Alloy envoie à Loki sans erreur" '! journalctl -u alloy --since "-2 min" --no-pager | grep -qiE "error.*(loki|push|send)"' 'systemctl restart alloy'
+controle "pare-feu ufw actif"           'ufw status | grep -q "Status: active"'              'ufw --force enable'
+controle "règle ufw Tailscale"          'ufw status | grep -q tailscale0'                    'ip link show tailscale0 && ufw allow in on tailscale0 comment Tailscale'
+controle "mises à jour sans redémarrage" 'grep -q "Automatic-Reboot \"false\"" /etc/apt/apt.conf.d/99cyremia-serveur'
 
 # ── Bilan ────────────────────────────────────────────────────────────────
 barre 100; echo
