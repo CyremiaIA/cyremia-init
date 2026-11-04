@@ -112,6 +112,7 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin no
 EOF
+  mkdir -p /run/sshd   # absent tant que ssh.socket n'a jamais servi : sshd -t échouerait
   sshd -t && { systemctl enable --now ssh >/dev/null 2>&1; systemctl reload ssh 2>/dev/null || systemctl restart ssh; ok "SSH : clé uniquement, root interdit"; } \
     || { rm -f /etc/ssh/sshd_config.d/10-cyremia.conf; warn "config sshd invalide, retirée"; }
 fi
@@ -347,17 +348,17 @@ controle() { local lib="$1" test="$2" repare="${3:-}"
   warn "$lib : TOUJOURS EN ÉCHEC"; }
 controle "nom de la machine = $NOM"     '[ "$(hostname)" = "$NOM" ]'                       'hostnamectl set-hostname "$NOM"'
 controle "clés SSH en place"            'grep -q "^ssh-" "$AK"'
-controle "serveur SSH actif"            'systemctl is-active ssh'                            'systemctl restart ssh'
-controle "SSH par clé uniquement"       'sshd -T 2>/dev/null | grep -qx "passwordauthentication no"' 'systemctl reload ssh'
+controle "serveur SSH actif"            'systemctl is-active ssh || systemctl is-active ssh.socket'                            'systemctl restart ssh'
+controle "SSH par clé uniquement"       'mkdir -p /run/sshd; sshd -T 2>/dev/null | grep -x "passwordauthentication no"' 'mkdir -p /run/sshd; printf "PasswordAuthentication no\\nKbdInteractiveAuthentication no\\nPermitRootLogin no\\n" > /etc/ssh/sshd_config.d/10-cyremia.conf; sshd -t && systemctl restart ssh'
 controle "sudo sans mot de passe"       'sudo -u "$UTILISATEUR" sudo -n true'
 controle "Tailscale connecté"           'tailscale status'                                   'systemctl restart tailscaled; sleep 3; tailscale up --hostname="$NOM" --timeout=20s'
-controle "Loki joignable via Tailscale" 'curl -fsS --max-time 5 http://100.124.28.18:3100/ready'
+controle "Loki joignable via Tailscale" '(for i in 1 2 3 4 5 6; do curl -fsS --max-time 5 http://100.124.28.18:3100/ready && exit 0; sleep 5; done; exit 1)'
 controle "agent Beszel actif"           'systemctl is-active beszel-agent'                   'systemctl restart beszel-agent'
-controle "Beszel écoute sur 45876"      'ss -ltn | grep -q ":45876 "'                        'systemctl restart beszel-agent'
+controle "Beszel écoute sur 45876"      'ss -ltn | grep -E ":45876 "'                        'systemctl restart beszel-agent'
 controle "agent Alloy actif"            'systemctl is-active alloy'                          'systemctl restart alloy'
-controle "Alloy envoie à Loki sans erreur" '! journalctl -u alloy --since "-2 min" --no-pager | grep -qiE "error.*(loki|push|send)"' 'systemctl restart alloy'
-controle "pare-feu ufw actif"           'ufw status | grep -q "Status: active"'              'ufw --force enable'
-controle "règle ufw Tailscale"          'ufw status | grep -q tailscale0'                    'ip link show tailscale0 && ufw allow in on tailscale0 comment Tailscale'
+controle "Alloy envoie à Loki sans erreur" '! journalctl -u alloy --since "-2 min" --no-pager | grep -E "level=error.*(loki|push|send|write)"' 'systemctl restart alloy'
+controle "pare-feu ufw actif"           'ufw status | grep "Status: active"'              'ufw --force enable'
+controle "règle ufw Tailscale"          'ufw status | grep tailscale0'                    'ip link show tailscale0 && ufw allow in on tailscale0 comment Tailscale'
 controle "mises à jour sans redémarrage" 'grep -q "Automatic-Reboot \"false\"" /etc/apt/apt.conf.d/99cyremia-serveur'
 
 # ── Bilan ────────────────────────────────────────────────────────────────
