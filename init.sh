@@ -23,6 +23,15 @@ msg()  { printf "${B}[cyremia %s]${N} %s\n" "$(date +%H:%M:%S)" "$*" | tee -a "$
 ok()   { printf "${V}   ✔ %s${N}\n" "$*" | tee -a "$LOG"; }
 warn() { printf "${J}   ⚠ %s${N}\n" "$*" | tee -a "$LOG"; ERREURS=$((ERREURS+1)); }
 ERREURS=0
+ETAPES=10; ETAPE=0
+# Barre d'avancement globale : [■■■■■□□□□□]  50 %  étape 5/10
+barre() { local p=$1 plein=$(( $1 / 5 )) b=""; for i in $(seq 1 20); do [ "$i" -le "$plein" ] && b="$b■" || b="$b·"; done
+  printf "\n${V}[%s] %3d %%${N}" "$b" "$p"; }
+etape() { ETAPE=$((ETAPE+1)); barre $(( (ETAPE-1) * 100 / ETAPES )); printf "  étape %d/%d\n" "$ETAPE" "$ETAPES"; msg "$*"; }
+# Lance une commande longue avec un indicateur animé et le temps écoulé
+travail() { local lib="$1"; shift; "$@" >>"$LOG" 2>&1 & local pid=$! t0=$SECONDS i=0 s='|/-\'
+  while kill -0 $pid 2>/dev/null; do printf "\r   %s %s… %ds " "${s:i++%4:1}" "$lib" $((SECONDS-t0)); sleep 0.2; done
+  wait $pid; local rc=$?; printf "\r\033[K"; return $rc; }
 # Les questions lisent le clavier, pas le script (qui arrive par le tube de curl)
 demander() { local r=""; if [ -r /dev/tty ]; then read -r -p "$1" r </dev/tty || true; fi; printf '%s' "$r"; }
 
@@ -45,7 +54,7 @@ echo
 msg "Journal complet : $LOG"
 
 # ── 0. Réseau ────────────────────────────────────────────────────────────
-msg "Vérification de l'accès à Internet"
+etape "Vérification de l'accès à Internet"
 for i in $(seq 1 30); do curl -fsS -o /dev/null --max-time 5 https://pkgs.tailscale.com && break; sleep 2; done \
   && ok "Internet joignable" || { printf "${R}Pas d'Internet : impossible de continuer.${N}\n"; exit 1; }
 
@@ -58,20 +67,20 @@ if [ -z "$NOM" ]; then
 fi
 if ! printf '%s' "$NOM" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'; then
   printf "${R}Nom invalide : %s${N}\n" "$NOM"; exit 1; fi
-msg "Nom de la machine : $NOM"
+etape "Nom de la machine : $NOM"
 hostnamectl set-hostname "$NOM"
 sed -i "/^127\.0\.1\.1/d" /etc/hosts; echo "127.0.1.1 $NOM" >> /etc/hosts
 ok "hostname = $NOM"
 
 # ── 2. Paquets de base ───────────────────────────────────────────────────
-msg "Mise à jour de la liste des paquets et installation des outils"
+etape "Mise à jour de la liste des paquets et installation des outils"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -q >>"$LOG" 2>&1 || warn "apt-get update a signalé une erreur"
-apt-get install -y -q curl ca-certificates ufw smartmontools htop jq unattended-upgrades openssh-server >>"$LOG" 2>&1 \
+travail "Liste des paquets" apt-get update -q || warn "apt-get update a signalé une erreur"
+travail "Installation des outils" apt-get install -y -q curl ca-certificates ufw smartmontools htop jq unattended-upgrades openssh-server \
   && ok "curl, ufw, smartmontools, htop, jq, openssh-server" || warn "installation des paquets incomplète"
 
 # ── 3. Accès SSH par clé ─────────────────────────────────────────────────
-msg "Clés SSH Cyremia pour l'utilisateur $UTILISATEUR"
+etape "Clés SSH Cyremia pour l'utilisateur $UTILISATEUR"
 id "$UTILISATEUR" >/dev/null 2>&1 || { useradd -m -s /bin/bash -G sudo "$UTILISATEUR"; ok "utilisateur $UTILISATEUR créé"; }
 HOME_U="$(getent passwd "$UTILISATEUR" | cut -d: -f6)"
 install -d -m 700 -o "$UTILISATEUR" -g "$UTILISATEUR" "$HOME_U/.ssh"
@@ -100,7 +109,7 @@ EOF
 fi
 
 # ── 4. Mises à jour automatiques sans redémarrage ───────────────────────
-msg "Mises à jour de sécurité automatiques (jamais de redémarrage seul)"
+etape "Mises à jour de sécurité automatiques (jamais de redémarrage seul)"
 cat > /etc/apt/apt.conf.d/99cyremia-serveur <<'EOF'
 // Cyremia : la machine se corrige seule mais ne redémarre JAMAIS d'elle-même.
 Unattended-Upgrade::Automatic-Reboot "false";
@@ -111,9 +120,9 @@ EOF
 ok "/etc/apt/apt.conf.d/99cyremia-serveur"
 
 # ── 5. Tailscale ─────────────────────────────────────────────────────────
-msg "Tailscale"
+etape "Tailscale"
 if ! command -v tailscale >/dev/null 2>&1; then
-  curl -fsSL https://tailscale.com/install.sh | sh >>"$LOG" 2>&1 && ok "Tailscale installé" || warn "installation de Tailscale échouée"
+  travail "Installation de Tailscale" sh -c "curl -fsSL https://tailscale.com/install.sh | sh" && ok "Tailscale installé" || warn "installation de Tailscale échouée"
 fi
 if command -v tailscale >/dev/null 2>&1; then
   if tailscale status >/dev/null 2>&1; then
@@ -131,14 +140,13 @@ if command -v tailscale >/dev/null 2>&1; then
 fi
 
 # ── 6. Agent Beszel (métriques) ──────────────────────────────────────────
-msg "Agent Beszel (métriques, port 45876 sur Tailscale uniquement)"
+etape "Agent Beszel (métriques, port 45876 sur Tailscale uniquement)"
 case "$(uname -m)" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; *) ARCH="" ;; esac
 if [ -n "$ARCH" ]; then
   if [ ! -x /opt/beszel-agent/beszel-agent ]; then
     id beszel >/dev/null 2>&1 || useradd -r -M -s /usr/sbin/nologin beszel
     install -d -o beszel -g beszel /opt/beszel-agent
-    curl -fsSL "https://github.com/henrygd/beszel/releases/latest/download/beszel-agent_linux_${ARCH}.tar.gz" \
-      | tar -xz -C /opt/beszel-agent beszel-agent && chown beszel:beszel /opt/beszel-agent/beszel-agent \
+    travail "Téléchargement de Beszel" sh -c "curl -fsSL https://github.com/henrygd/beszel/releases/latest/download/beszel-agent_linux_${ARCH}.tar.gz | tar -xz -C /opt/beszel-agent beszel-agent" && chown beszel:beszel /opt/beszel-agent/beszel-agent \
       && ok "binaire Beszel installé" || warn "téléchargement de Beszel échoué"
   fi
   usermod -aG disk beszel 2>/dev/null || true
@@ -174,12 +182,12 @@ EOF
 fi
 
 # ── 7. Agent Alloy (journaux → Loki) ─────────────────────────────────────
-msg "Agent Alloy (journaux système vers Loki)"
+etape "Agent Alloy (journaux système vers Loki)"
 if [ -n "$ARCH" ]; then
   if ! command -v alloy >/dev/null 2>&1 || ! alloy --version 2>/dev/null | grep -q "$ALLOY_VERSION"; then
     DEB="/tmp/alloy-${ALLOY_VERSION}.deb"
-    curl -fsSL -o "$DEB" "https://github.com/grafana/alloy/releases/download/v${ALLOY_VERSION}/alloy-${ALLOY_VERSION}-1.${ARCH}.deb" \
-      && apt-get install -y -q "$DEB" >>"$LOG" 2>&1 && ok "Alloy $ALLOY_VERSION installé" || warn "installation d'Alloy échouée"
+    travail "Téléchargement d'Alloy" curl -fsSL -o "$DEB" "https://github.com/grafana/alloy/releases/download/v${ALLOY_VERSION}/alloy-${ALLOY_VERSION}-1.${ARCH}.deb" \
+      && travail "Installation d'Alloy" apt-get install -y -q "$DEB" && ok "Alloy $ALLOY_VERSION installé" || warn "installation d'Alloy échouée"
     rm -f "$DEB"
   fi
   if [ -d /etc/alloy ]; then
@@ -305,7 +313,7 @@ EOF
 fi
 
 # ── 8. Pare-feu ──────────────────────────────────────────────────────────
-msg "Pare-feu ufw : tout fermé sauf SSH (22) et Tailscale"
+etape "Pare-feu ufw : tout fermé sauf SSH (22) et Tailscale"
 ufw --force default deny incoming >/dev/null
 ufw --force default allow outgoing >/dev/null
 ufw allow 22/tcp comment 'SSH' >/dev/null
@@ -313,14 +321,14 @@ ip link show tailscale0 >/dev/null 2>&1 && ufw allow in on tailscale0 comment 'T
 ufw --force enable >/dev/null && ok "ufw actif" || warn "ufw n'a pas pu être activé"
 
 # ── 9. Disques ───────────────────────────────────────────────────────────
-msg "État SMART des disques"
+etape "État SMART des disques"
 for d in $(lsblk -dno NAME,TYPE | awk '$2=="disk"{print $1}'); do
   s="$(smartctl -H /dev/$d 2>/dev/null | grep -Eo 'PASSED|FAILED|OK' | head -1)"
   [ -n "$s" ] && echo "   /dev/$d : $s" | tee -a "$LOG"
 done
 
 # ── Bilan ────────────────────────────────────────────────────────────────
-echo
+barre 100; echo
 msg "TERMINÉ — $NOM"
 echo "   IP locale     : $(hostname -I | awk '{print $1}')"
 echo "   IP Tailscale  : ${TSIP:-non connecté}"
