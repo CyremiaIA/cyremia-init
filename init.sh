@@ -6,6 +6,10 @@
 #   (ou)  sudo bash init.sh [nom-de-la-machine]
 #
 # Variables facultatives : NOM=cyr-pc-xxx-01  TS_AUTHKEY=tskey-auth-…
+#                          LOKI_PUSH_PASSWORD=…  (identifiant `agent` du proxy Loki)
+# Sans LOKI_PUSH_PASSWORD, le mot de passe est repris d'une installation précédente
+# (/etc/default/alloy), sinon demandé au clavier (saisie masquée). Réponse vide :
+# l'agent Alloy n'est pas installé (avertissement), le reste se poursuit.
 # Idempotent : on peut le relancer autant de fois que nécessaire.
 # Ce fichier ne contient AUCUN secret (clés SSH publiques seulement).
 # ─────────────────────────────────────────────────────────────────────────
@@ -34,6 +38,13 @@ travail() { local lib="$1"; shift; "$@" >>"$LOG" 2>&1 & local pid=$! t0=$SECONDS
   wait $pid; local rc=$?; printf "\r\033[K"; return $rc; }
 # Les questions lisent le clavier, pas le script (qui arrive par le tube de curl)
 demander() { local r=""; if [ -r /dev/tty ]; then read -r -p "$1" r </dev/tty || true; fi; printf '%s' "$r"; }
+# Même chose sans écho à l'écran (mot de passe)
+demander_secret() { local r=""; if [ -r /dev/tty ]; then read -r -s -p "$1" r </dev/tty || true; echo >/dev/tty; fi; printf '%s' "$r"; }
+# Teste l'identifiant d'envoi Loki par un lot vide (n'écrit rien). Le mot de passe
+# passe par l'entrée standard de curl (-K -), jamais par la ligne de commande.
+# Affiche le code HTTP : 204 = accepté, 401 = refusé, 000 = injoignable.
+verif_loki() { printf 'user = "agent:%s"\n' "$LOKI_MDP" | curl -s -o /dev/null -w '%{http_code}' --max-time 8 -K - \
+  -H 'Content-Type: application/json' --data '{"streams":[]}' "$LOKI_URL" 2>/dev/null; }
 
 if [ "$(id -u)" -ne 0 ]; then echo "À lancer avec sudo :  curl -fsSL … | sudo bash" >&2; exit 1; fi
 
@@ -67,6 +78,24 @@ if [ -z "$NOM" ]; then
 fi
 if ! printf '%s' "$NOM" | grep -Eq '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'; then
   printf "${R}Nom invalide : %s${N}\n" "$NOM"; exit 1; fi
+
+# Mot de passe d'envoi Loki (identifiant `agent`), demandé dès le début pour que la
+# suite tourne sans surveillance. Jamais affiché ni écrit dans le journal.
+LOKI_MDP="${LOKI_PUSH_PASSWORD:-}"
+if [ -z "$LOKI_MDP" ] && [ -r /etc/default/alloy ]; then
+  LOKI_MDP="$(sed -n 's/^LOKI_PUSH_PASSWORD="\(.*\)"$/\1/p' /etc/default/alloy)"
+  [ -n "$LOKI_MDP" ] && echo "   Mot de passe d'envoi Loki : repris de /etc/default/alloy"
+fi
+if [ -z "$LOKI_MDP" ]; then
+  echo "   Mot de passe d'envoi Loki (identifiant « agent ») : ~/.config/cyremia/loki-envoi"
+  echo "   sur le Mac d'Aymeric, ou variable Coolify LOKI_PUSH_PASSWORD. Vide = Alloy non installé."
+  LOKI_MDP="$(demander_secret "   Mot de passe (la saisie ne s'affiche pas) : ")"
+fi
+# Il finit entre guillemets dans /etc/default/alloy (EnvironmentFile de systemd)
+case "$LOKI_MDP" in *[\"\\\`\$]*|*$'\n'*)
+  printf "${R}   Mot de passe Loki ignoré : guillemet, antislash, \$, accent grave ou saut de ligne interdits.${N}\n"
+  LOKI_MDP="" ;;
+esac
 etape "Nom de la machine : $NOM"
 hostnamectl set-hostname "$NOM"
 sed -i "/^127\.0\.1\.1/d" /etc/hosts; echo "127.0.1.1 $NOM" >> /etc/hosts
@@ -191,8 +220,30 @@ EOF
 fi
 
 # ── 7. Agent Alloy (journaux → Loki) ─────────────────────────────────────
+# Aligné sur cyremia-logs/agent-systemd (install.sh + config.alloy) : toute
+# modification de la config là-bas doit être recopiée ici.
 etape "Agent Alloy (journaux système vers Loki)"
-if [ -n "$ARCH" ]; then
+ALLOY_SAUTE=""
+if [ -z "$ARCH" ]; then
+  ALLOY_SAUTE="architecture non gérée"
+elif [ -z "$LOKI_MDP" ]; then
+  ALLOY_SAUTE="mot de passe d'envoi Loki absent"
+else
+  # Vérifie l'identifiant avant d'installer : un mauvais mot de passe donnerait un
+  # agent « actif » dont tous les envois sont refusés en 401, sans erreur visible.
+  case "$(verif_loki)" in
+    204|200) ok "identifiant d'envoi Loki accepté" ;;
+    401|403) ALLOY_SAUTE="mot de passe d'envoi Loki refusé par le proxy (401)" ;;
+    *)       warn "Loki injoignable pour l'instant : mot de passe non vérifié, installation quand même" ;;
+  esac
+fi
+if [ -n "$ALLOY_SAUTE" ]; then
+  warn "Alloy NON installé : $ALLOY_SAUTE"
+  printf "${J}     Pour l'ajouter : relancer ce script avec le mot de passe d'envoi Loki.${N}\n"
+  if [ -f /etc/default/alloy ] && ! grep -q '^LOKI_PUSH_PASSWORD=' /etc/default/alloy; then
+    printf "${J}     Un ancien agent Alloy sans identifiant est présent : tous ses envois sont refusés.${N}\n"
+  fi
+else
   if ! command -v alloy >/dev/null 2>&1 || ! alloy --version 2>/dev/null | grep -q "$ALLOY_VERSION"; then
     DEB="/tmp/alloy-${ALLOY_VERSION}.deb"
     essayer "Téléchargement d'Alloy" curl -fsSL -o "$DEB" "https://github.com/grafana/alloy/releases/download/v${ALLOY_VERSION}/alloy-${ALLOY_VERSION}-1.${ARCH}.deb" \
@@ -237,6 +288,45 @@ loki.source.journal "system" {
 // plus le bruit propre à une machine de bureau avec session graphique.
 loki.process "clean_journal" {
   forward_to = [loki.write.default.receiver]
+
+  // 0. MASQUAGE DES SECRETS — toujours en premier, avant tout autre traitement.
+  //    Loki n'a pas d'authentification : tout ce qui y entre est lisible par le
+  //    tailnet entier pendant 6 mois. Audit du 2026-11-21 : jetons Google des MCP
+  //    (`tokeninfo?access_token=`) et clé du kiosque (`display…/?k=`) en clair.
+  //    stage.replace remplace chaque groupe capturé par "***" : la ligne reste,
+  //    seule la valeur disparaît. Corriger aussi la source quand on en trouve une.
+  //    Paramètres d'URL sensibles (?access_token=, &k=, &password=…).
+  stage.replace {
+    expression = "(?i)[?&](?:access_token|refresh_token|id_token|token|api_?key|key|k|secret|client_secret|password|passwd|pwd|signature|sig|session_?id|sid)=([^&\\s\"'<>]+)"
+    replace    = "***"
+  }
+  //    En-têtes Authorization / Bearer.
+  stage.replace {
+    expression = "(?i)\\bbearer\\s+([A-Za-z0-9._~+/=-]{8,})"
+    replace    = "***"
+  }
+  stage.replace {
+    expression = "(?i)authorization[\"']?\\s*[:=]\\s*[\"']?(?:basic\\s+|token\\s+)?([A-Za-z0-9._~+/=-]{8,})"
+    replace    = "***"
+  }
+  //    JWT, champs JSON sensibles, identifiants dans une URL (proto://user:mdp@).
+  stage.replace {
+    expression = "(eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]*)"
+    replace    = "***"
+  }
+  stage.replace {
+    expression = "(?i)\"(?:password|passwd|secret|client_secret|api_?key|access_token|refresh_token|id_token|token)\"\\s*:\\s*\"([^\"]+)\""
+    replace    = "***"
+  }
+  stage.replace {
+    expression = "(?i)\\b[a-z][a-z0-9+.-]*://[^:/\\s@]+:([^@\\s/]+)@"
+    replace    = "***"
+  }
+  //    Clés d'API à préfixe reconnaissable (Anthropic, OpenAI, GitHub, Slack, AWS).
+  stage.replace {
+    expression = "(sk-ant-[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[abps]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})"
+    replace    = "***"
+  }
 
   stage.match {
     selector = "{unit=\"tailscaled.service\"}"
@@ -303,16 +393,26 @@ loki.process "clean_journal" {
 loki.write "default" {
   endpoint {
     url = sys.env("LOKI_URL")
+    // Loki est derrière un proxy qui exige l'identifiant `agent` (envoi seul).
+    // Sans LOKI_PUSH_PASSWORD, les envois sont refusés en 401 (visible dans les
+    // logs d'Alloy) : rien n'est perdu côté Loki, rien n'est accepté non plus.
+    basic_auth {
+      username = "agent"
+      password = sys.env("LOKI_PUSH_PASSWORD")
+    }
   }
 }
 ALLOYCFG
+    # Le fichier contient un mot de passe : lisible par root et le groupe alloy seulement.
+    install -m 0640 -o root -g alloy /dev/null /etc/default/alloy
     cat > /etc/default/alloy <<EOF
-## Généré par le script d'initialisation Cyremia.
+## Généré par le script d'initialisation Cyremia (cyremia-init) — ne pas éditer à la main.
 CONFIG_FILE="/etc/alloy/config.alloy"
 CUSTOM_ARGS="--storage.path=/var/lib/alloy/data --server.http.listen-addr=127.0.0.1:12345"
 RESTART_ON_UPGRADE=true
 HOSTNAME_LABEL="$NOM"
 LOKI_URL="$LOKI_URL"
+LOKI_PUSH_PASSWORD="$LOKI_MDP"
 EOF
     usermod -aG systemd-journal alloy 2>/dev/null || true
     if [ ! -d /var/log/journal ]; then mkdir -p /var/log/journal; systemd-tmpfiles --create --prefix /var/log/journal; systemctl restart systemd-journald; fi
@@ -355,8 +455,13 @@ controle "Tailscale connecté"           'tailscale status'                     
 controle "Loki joignable via Tailscale" '(for i in 1 2 3 4 5 6; do curl -fsS --max-time 5 http://100.124.28.18:3100/ready && exit 0; sleep 5; done; exit 1)'
 controle "agent Beszel actif"           'systemctl is-active beszel-agent'                   'systemctl restart beszel-agent'
 controle "Beszel écoute sur 45876"      'ss -ltn | grep -E ":45876 "'                        'systemctl restart beszel-agent'
+if [ -z "$ALLOY_SAUTE" ]; then
 controle "agent Alloy actif"            'systemctl is-active alloy'                          'systemctl restart alloy'
-controle "Alloy envoie à Loki sans erreur" '! journalctl -u alloy --since "-2 min" --no-pager | grep -E "level=error.*(loki|push|send|write)"' 'systemctl restart alloy'
+controle "identifiant Loki accepté"     '[ "$(verif_loki)" = 204 ]'
+controle "Alloy envoie à Loki sans erreur" '! journalctl -u alloy --since "-2 min" --no-pager | grep -E "level=error.*(loki|push|send|write)|status=40[13]"' 'systemctl restart alloy'
+else
+warn "agent Alloy absent ($ALLOY_SAUTE) : aucun journal de cette machine dans Loki"
+fi
 controle "pare-feu ufw actif"           'ufw status | grep "Status: active"'              'ufw --force enable'
 controle "règle ufw Tailscale"          'ufw status | grep tailscale0'                    'ip link show tailscale0 && ufw allow in on tailscale0 comment Tailscale'
 controle "mises à jour sans redémarrage" 'grep -q "Automatic-Reboot \"false\"" /etc/apt/apt.conf.d/99cyremia-serveur'
